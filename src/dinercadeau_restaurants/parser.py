@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 from .models import Restaurant, merge_tags
 
@@ -127,78 +128,146 @@ def parse_listing_page(html: str) -> List[Restaurant]:
         logger.debug("Extracted %d restaurants from ld+json blocks", len(restaurants))
         return restaurants
 
-    # As a fallback, attempt to parse Nuxt bootstrap data.
-    script_text = None
-    for script in soup.find_all("script"):
-        if not script.string:
-            continue
-        match = SCRIPT_JSON_RE.search(script.string)
-        if match:
-            script_text = match.group(1)
-            break
-    if script_text:
-        try:
-            payload = json.loads(script_text)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse Nuxt payload", exc_info=True)
-        else:
-            restaurants.extend(_parse_nuxt_payload(payload))
+    # As a fallback, attempt to parse the Nuxt bootstrap data which is exposed
+    # either as ``window.__NUXT__`` or inside ``<script type="application/json"``
+    # blocks (Nuxt 3's ``__NUXT_DATA__`` payloads).
+    seen_urls: set[str] = set()
+    for payload in _iter_script_payloads(soup):
+        for restaurant in _parse_nuxt_payload(payload):
+            if restaurant.url and restaurant.url not in seen_urls:
+                restaurants.append(restaurant)
+                seen_urls.add(restaurant.url)
 
     return restaurants
 
 
-def _parse_nuxt_payload(payload: dict) -> Iterable[Restaurant]:
+def _iter_script_payloads(soup: BeautifulSoup) -> Iterator[Any]:
+    for script in soup.find_all("script"):
+        text = script.string or script.get_text()
+        if not text:
+            continue
+
+        data: Any = None
+        if script.get("type") == "application/json":
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                logger.debug("Failed to decode JSON script block", exc_info=True)
+                continue
+        else:
+            match = SCRIPT_JSON_RE.search(text)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    logger.debug("Failed to decode window.__NUXT__ payload", exc_info=True)
+                    continue
+        if data is not None:
+            yield data
+
+
+def _parse_nuxt_payload(payload: Any) -> Iterable[Restaurant]:
     """Parse a subset of the Nuxt payload structure used by the website."""
 
-    if not isinstance(payload, dict):
-        return []
-
-    data = payload.get("data") or []
     results: List[Restaurant] = []
 
-    def parse_entry(entry: dict) -> Optional[Restaurant]:
-        if not isinstance(entry, dict):
-            return None
-        name = entry.get("name") or entry.get("title")
-        if not name:
-            return None
-        url = entry.get("slug") or entry.get("url")
-        if url and not url.startswith("http"):
-            url = f"https://www.diner-cadeau.nl{url}"
-        description = entry.get("excerpt") or entry.get("description")
-        tags = entry.get("categories") or entry.get("labels") or []
-        if isinstance(tags, dict):
-            tags = tags.values()
-        elif isinstance(tags, str):
-            tags = [tags]
-        rating = entry.get("rating") or entry.get("score")
-        review_count = entry.get("reviews") or entry.get("review_count")
-        location = entry.get("location") or {}
-        if not isinstance(location, dict):
-            location = {}
-
-        return Restaurant(
-            name=name,
-            url=url or "",
-            city=location.get("city"),
-            address=location.get("address"),
-            postal_code=location.get("postal_code"),
-            description=description,
-            tags=merge_tags(tags),
-            rating=_safe_float(rating),
-            review_count=_safe_int(review_count),
-            latitude=_safe_float(location.get("lat")),
-            longitude=_safe_float(location.get("lng")),
-        )
-
-    for item in data:
-        if isinstance(item, dict):
-            results.extend(filter(None, (parse_entry(entry) for entry in item.get("restaurants", []))))
-            candidate = parse_entry(item)
-            if candidate:
-                results.append(candidate)
+    for entry in _iter_candidate_dicts(payload):
+        restaurant = _convert_candidate(entry)
+        if restaurant:
+            results.append(restaurant)
 
     return results
+
+
+def _iter_candidate_dicts(payload: Any) -> Iterator[Dict[str, Any]]:
+    stack: List[Any] = [payload]
+    seen: set[int] = set()
+
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            ident = id(current)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            if _looks_like_restaurant(current):
+                yield current
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple, set)):
+            stack.extend(current)
+
+
+def _looks_like_restaurant(entry: Dict[str, Any]) -> bool:
+    name = entry.get("name") or entry.get("title")
+    if not name:
+        return False
+    if not any(key in entry for key in ("slug", "url", "link", "permalink")):
+        return False
+    if not any(key in entry for key in ("address", "location", "city", "plaats")):
+        return False
+    return True
+
+
+def _convert_candidate(entry: Dict[str, Any]) -> Optional[Restaurant]:
+    name = entry.get("name") or entry.get("title")
+    if not name:
+        return None
+
+    url = entry.get("url") or entry.get("permalink") or entry.get("link") or entry.get("slug")
+    if url:
+        if isinstance(url, dict):
+            url = url.get("href") or url.get("url")
+        if isinstance(url, Sequence) and not isinstance(url, (str, bytes)):
+            url = next((item for item in url if isinstance(item, str)), None)
+    if isinstance(url, str) and not url.startswith("http"):
+        url = urljoin("https://www.diner-cadeau.nl", url)
+
+    description = entry.get("excerpt") or entry.get("description") or entry.get("intro")
+
+    tags_source: List[str] = []
+    for key in ("categories", "labels", "tags", "cuisines"):
+        value = entry.get(key)
+        tags_source.extend(_normalize_iterable(value))
+
+    rating = entry.get("rating") or entry.get("score") or entry.get("averageRating")
+    review_count = entry.get("reviews") or entry.get("review_count") or entry.get("ratingCount")
+
+    location = _coerce_location(entry)
+
+    return Restaurant(
+        name=name,
+        url=url or "",
+        city=location.get("city") or location.get("plaats"),
+        address=location.get("address") or location.get("street") or location.get("streetAddress"),
+        postal_code=location.get("postal_code") or location.get("postalCode") or location.get("zip") or location.get("zipcode"),
+        description=description,
+        tags=merge_tags(tags_source),
+        rating=_safe_float(rating),
+        review_count=_safe_int(review_count),
+        latitude=_safe_float(location.get("lat") or location.get("latitude")),
+        longitude=_safe_float(location.get("lng") or location.get("longitude")),
+    )
+
+
+def _normalize_iterable(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [str(item) for item in value.values()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value]
+    if isinstance(value, str):
+        return [value]
+    return [str(value)]
+
+
+def _coerce_location(entry: Dict[str, Any]) -> Dict[str, Any]:
+    location = entry.get("location") or entry.get("address") or {}
+    if isinstance(location, list) and location:
+        location = location[0]
+    if not isinstance(location, dict):
+        location = {}
+    return location
 
 
 def _safe_int(value: object) -> Optional[int]:

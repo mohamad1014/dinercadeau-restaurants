@@ -6,7 +6,17 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, Mapping, Optional
 
 DEFAULT_BASE_URL = "https://www.diner-cadeau.nl"
-DEFAULT_LIST_PATH = "/restaurant"
+# Listing pages for Diner Cadeau are exposed under the ``/dinerbon-restaurants``
+# path (e.g. ``https://www.diner-cadeau.nl/dinerbon-restaurants?plaats=Utrecht``).
+#
+# The original implementation accidentally pointed at ``/restaurant`` which is a
+# marketing landing page that does not include any structured data.  As a
+# result, the scraper would happily fetch HTML but the parser could not discover
+# any restaurant entries.
+#
+# By using the correct list path here, every downstream component automatically
+# fetches the real paginated listings.
+DEFAULT_LIST_PATH = "/dinerbon-restaurants"
 UTRECHT_COORDINATES = (52.0907, 5.1214)
 
 
