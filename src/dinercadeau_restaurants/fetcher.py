@@ -22,6 +22,12 @@ class DinerCadeauFetcher:
         self._session = requests.Session()
         self._session.headers.update(self.settings.headers())
 
+    @property
+    def session(self) -> requests.Session:
+        """Return the HTTP session used to fetch listing pages."""
+
+        return self._session
+
     def fetch(self, page: int) -> ListingPage:
         """Fetch a single listing page and return metadata."""
 

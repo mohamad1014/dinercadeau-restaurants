@@ -25,7 +25,13 @@ def run_pipeline(settings: Optional[PipelineSettings] = None) -> List[Restaurant
 
     restaurants: List[Restaurant] = []
     for page in fetcher.iter_pages():
-        parsed = parse_listing_page(page.html)
+        parsed = parse_listing_page(
+            page.html,
+            city=fetcher.settings.city,
+            page_number=page.page_number,
+            page_url=page.url,
+            session=fetcher.session,
+        )
         logger.info("Parsed %d restaurants from %s", len(parsed), page.url)
         restaurants.extend(parsed)
 
